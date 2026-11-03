@@ -1,0 +1,167 @@
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "dma.h"
+#include "spi.h"
+#include "usart.h"
+#include "gpio.h"
+#include <stdio.h>
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+
+/* USER CODE BEGIN 4 */
+
+/* ===========================================================================
+ * 【OTA 调试探针】直接用寄存器往 USART1 发一个字符。
+ * 不依赖 HAL / printf / 中断，只要 Bootloader 把 USART1 配好了就能用。
+ * 正常启动在串口上应该依次看到: 1 2 C 3 4 5 6 7
+ * 停在哪一位，就说明死在它前面那一步。定位完可以把这一段整体删掉。
+ * （带超时保护：冷启动时 USART1 还没配好也不会卡死）
+ * =========================================================================== */
+#define OTA_PROBE(c)   do { \
+        uint32_t _probe_to = 200000U; \
+        USART1->DR = (uint8_t)(c); \
+        while (((USART1->SR & USART_SR_TC) == 0U) && (--_probe_to != 0U)) { } \
+    } while (0)
+
+// 串口重定向，让 printf 能直接打印
+int fputc(int ch, FILE *f)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+    return ch;
+}
+/* USER CODE END 4 */
+
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  OTA_PROBE('1');                 /* 收到 1 = 跳转成功，已经进 main 了 */
+  /* USER CODE END 1 */
+
+  // 【极其重要】重定向中断向量表
+  SCB->VTOR = 0x08005000; 
+
+  // 2. 【极其重要】清除从 Bootloader 带过来的挂起中断
+  NVIC_ClearPendingIRQ(USART1_IRQn);
+  NVIC_ClearPendingIRQ(USART3_IRQn);
+  
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+  OTA_PROBE('2');                 /* HAL 初始化完成 */
+
+  /* =========================================================================
+   * 【关键修复】总中断必须在这里就打开。
+   * Bootloader 里 __disable_irq() 设的 PRIMASK 会一路带进 APP，如果等到所有
+   * 外设都初始化完才 __enable_irq()，在这之前 SysTick_Handler 不执行、uwTick
+   * 不增加、HAL_GetTick() 永远返回同一个值 —— HAL 里所有"等标志位 + 超时"的
+   * 循环都会变成死等，连 HAL_TIMEOUT 都等不到。
+   * ======================================================================= */
+  __enable_irq();
+
+  /* Configure the system clock */
+  SystemClock_Config();
+  OTA_PROBE('3');                 /* 时钟就绪 */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  OTA_PROBE('4');                 /* GPIO 完成，PA1 已经配成推挽输出了 */
+  MX_DMA_Init();
+  MX_SPI1_Init();
+  MX_USART1_UART_Init();
+  OTA_PROBE('5');                 /* USART1 重新初始化完成 */
+  MX_USART3_UART_Init();
+  /* USER CODE BEGIN 2 */
+  OTA_PROBE('6');                 /* 所有外设初始化完成 */
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  OTA_PROBE('7');                 /* 进主循环，灯应该开始闪了 */
+  while (1)
+  {
+      /* 纯寄存器闪灯：不依赖 HAL_Delay / SysTick，只要跑到这里就一定会闪，
+         方便把"没跑到这里"和"跑到了但灯不亮"区分开 */
+      GPIOA->BRR  = GPIO_PIN_1;
+      for (volatile uint32_t i = 0; i < 400000U; i++) { }
+      GPIOA->BSRR = GPIO_PIN_1;
+      for (volatile uint32_t i = 0; i < 400000U; i++) { }
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  uint32_t retry = 0;
+
+  /* =========================================================================
+   * 【OTA 跳转后死机的根因，就在这里】
+   * STM32F1 的 HAL_RCC_OscConfig() 里有一段专门判断：
+   *     if (__HAL_RCC_GET_SYSCLK_SOURCE() != RCC_SYSCLKSOURCE_STATUS_PLLCLK)
+   *     { ...... 正常配置 PLL ...... }
+   *     else
+   *     { 只比较 PLLSRC/PLLMUL，不一致就直接 return HAL_ERROR; }
+   * 从 Bootloader 跳过来时 SYSCLK 正好是 PLL，走的是 else 那条路；
+   * 一旦返回 HAL_ERROR，下面的 Error_Handler() 就是 __disable_irq() + while(1)，
+   * 不亮灯、不打印，看着就跟死机一样。
+   * 而 DAP 直接烧录是冷启动，SYSCLK=HSI，走正常路径，所以独立运行没毛病。
+   *
+   * 处理办法：Bootloader 已经把 8MHz*9=72MHz 建好了，APP 直接继承，别再重配。
+   * ======================================================================= */
+  if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL)
+  {
+    SystemCoreClock = 72000000U;      /* 8MHz HSE * 9，Bootloader 已配好 */
+    OTA_PROBE('C');                   /* C = 继承 Bootloader 的 72MHz 时钟 */
+    return;
+  }
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;   /* 8MHz * 9 = 72MHz */
+
+  /* 冷启动路径：失败重试 3 次，别一失败就进死循环 */
+  for (retry = 0U; retry < 3U; retry++)
+  {
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) == HAL_OK)
+    {
+      break;
+    }
+    HAL_Delay(10);
+  }
+  if (retry >= 3U)
+  {
+    OTA_PROBE('E');                   /* E = HSE/PLL 起不来 */
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    OTA_PROBE('F');                   /* F = 切换到 PLL 失败 */
+    Error_Handler();
+  }
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
